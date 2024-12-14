@@ -1,0 +1,1169 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2024 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "usb_host.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "stm32f4xx_hal.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct {
+    float target_angle;
+    int current_steps;
+    int total_steps;
+    float speed;
+    bool target_reached;
+    int direction; // 1 = forward, 0 = reverse
+    float current_angle; // Lưu góc hiện tại của động cơ
+} Motor;
+
+typedef struct {
+    float x;
+    float y;
+    float z;
+} Position;
+#define UART_RX_BUFFER_SIZE 500
+// File main.c hoặc header file (main.h)
+#define MAX_COORDS 10
+
+// Khai báo kiểu dữ liệu struct Point chuẩn
+typedef struct {
+    float x;
+    float y;
+    uint8_t color;
+} Point;
+#define MAX_POINTS 100 // Giới hạn số điểm tối đa
+
+Point points[MAX_POINTS];  // Mảng lưu trữ các tọa độ
+int point_index = 0;       // Ban đầu không có bất kỳ điểm nào
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define MAX_RPM 300
+#define MIN_RPM 100
+#define HOME_RPM 60
+#define CLOCK_FREQ 84000000
+#define MICROSTEPPING 64
+#define STEP_ANGLE 1.8
+#define GEARBOX 10
+
+//  ?ịnh nghĩa chân DIR cho từng động cơ
+#define MOTOR1_DIR_PIN GPIO_PIN_10
+#define MOTOR2_DIR_PIN GPIO_PIN_12
+#define MOTOR3_DIR_PIN GPIO_PIN_14
+
+#define MOTOR1_DIR_PORT GPIOE
+#define MOTOR2_DIR_PORT GPIOE
+#define MOTOR3_DIR_PORT GPIOE
+
+#define HOME_SENSOR1_PIN GPIO_PIN_8
+#define HOME_SENSOR2_PIN GPIO_PIN_9
+#define HOME_SENSOR3_PIN GPIO_PIN_10
+
+#define HOME_SENSOR1_PORT GPIOD
+#define HOME_SENSOR2_PORT GPIOD
+#define HOME_SENSOR3_PORT GPIOD
+
+#define BUM_PIN GPIO_PIN_0
+#define BUM_PORT GPIOD
+
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+I2S_HandleTypeDef hi2s3;
+
+SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
+
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
+
+/* USER CODE BEGIN PV */
+// Thông số hình hoc của robot delta
+const float e = 40.0;    //  ?ầu cuối
+const float f = 100.0;    //  ?ế
+const float re = 370.0;
+const float rf = 220.0;
+
+// Hằng số lượng giác
+const float sqrt3 = sqrt(3.0);
+const float pi = 3.141592653;
+const float sin120 = sqrt3 / 2.0;
+const float cos120 = -0.5;
+const float tan60 = sqrt3;
+const float sin30 = 0.5;
+const float tan30 = 1 / sqrt3;
+
+Motor motor1 = {0, 0, 0, MIN_RPM, false, 0, 0};
+Motor motor2 = {0, 0, 0, MIN_RPM, false, 0, 0};
+Motor motor3 = {0, 0, 0, MIN_RPM, false, 0, 0};
+
+float ratio1 = 1.0, ratio2 = 1.0, ratio3 = 1.0;
+int max_steps = 0;
+bool HOME_CHECK = false;
+Position current_position ;
+//Coordinate current_coordinate;
+volatile char uart_rx_buffer[UART_RX_BUFFER_SIZE]; // Bộ đệm nhận DMA
+volatile uint8_t data_received_flag = 0;          // C ? báo dữ liệu đã nhận xong
+             // Vị trí lưu dữ liệu tiếp theo
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_I2S3_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
+void MX_USB_HOST_Process(void);
+
+/* USER CODE BEGIN PFP */
+int delta_calcAngleYZ(float x0, float y0, float z0, float *theta);
+int calculate_steps(float angle);
+float sigmoid_acceleration(float progress);
+void update_speed(Motor *motor);
+void step_motor(Motor *motor, GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_TypeDef *DIR_PORT, uint16_t DIR_PIN);
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
+void init_motors();
+void start_timers();
+bool all_motors_reached_target();
+int delta_calcInverse(float x0, float y0, float z0, float *theta1, float *theta2, float *theta3);
+int delta_calcForward(float theta1, float theta2, float theta3, float *x0, float *y0, float *z0);
+void move_to(float x_target, float y_target, float z_target);
+void move_to_home();
+void ProcessReceivedData();
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+void turn_on_pump() ;
+void turn_off_pump();
+bool isDuplicate(float x, float y, uint8_t color);
+void addPoint(float x, float y, uint8_t color);
+void handle_uart_data(uint8_t color, float x, float y);
+void move_to_fix(float x_target, float y_target, float z_target);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void move_to_fix(float x_target, float y_target, float z_target){
+	if(x_target>0 && y_target>0 && y_target<x_target){
+		z_target=0.1425*sqrt(x_target*x_target + y_target*y_target)-351.27 ;
+			}
+	if(x_target>0 && y_target>0 && y_target>x_target){
+			z_target=0.2318*sqrt(x_target*x_target + y_target*y_target)-360.89 ;
+				}
+	if(x_target>0 && y_target<0 && abs(y_target)>x_target){
+				z_target=0.2295*sqrt(x_target*x_target + y_target*y_target)-361 ;
+					}
+	if(x_target<0 && y_target>0 && y_target>abs(x_target)){
+		z_target=0.1527*sqrt(x_target*x_target + y_target*y_target)-353.08;
+					}
+	if(x_target<0 && y_target>0 && y_target<abs(x_target)){
+			z_target=0.1054*sqrt(x_target*x_target + y_target*y_target)-349.50;
+						}
+	if(x_target>0 && y_target<0 && abs(y_target)<x_target){
+		z_target=0.1741*sqrt(x_target*x_target + y_target*y_target)-355.94;
+		}
+
+	move_to(x_target, y_target, z_target);
+}
+void handle_uart_data(uint8_t color, float x, float y) {
+    if (point_index < 100) {
+        points[point_index].color = color;  // Gán giá trị màu
+        points[point_index].x = x;         // Gán tọa độ x
+        points[point_index].y = y;         // Gán tọa độ y
+        point_index++;                     // Tăng chỉ số điểm tiếp theo
+    }
+}
+
+// Hàm kiểm tra xem giá trị mới đã tồn tại chưa
+bool isDuplicate(float x, float y, uint8_t color) {
+    for (int i = 0; i < point_index; i++) {
+        // So sánh từng phần tử trong mảng `points` với giá trị mới
+        if (fabs(points[i].x - x) < 0.001 &&  // So sánh x với sai số nhỏ
+            fabs(points[i].y - y) < 0.001 &&  // So sánh y với sai số nhỏ
+            points[i].color == color) {       // So sánh color
+            return true; // Điểm đã tồn tại
+        }
+    }
+    return false; // Điểm chưa tồn tại
+}
+
+void addPoint(float x, float y, uint8_t color) {
+    if (point_index < MAX_POINTS) {
+        points[point_index].x = x;
+        points[point_index].y = y;
+        points[point_index].color = color;
+        point_index++; // Tăng số lượng điểm sau khi thêm thành công
+    } else {
+        printf("Mảng điểm đầy, không thể lưu thêm!\n");
+    }
+}
+
+
+
+// Bật bơm
+void turn_on_pump() {
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0, GPIO_PIN_SET);  // Bật chân PD0
+    printf("Pump turned ON.\n");
+    HAL_UART_DMAStop(&huart2);
+}
+
+// Tắt bơm
+void turn_off_pump() {
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0, GPIO_PIN_RESET);  // Tắt chân PD0
+    printf("Pump turned OFF.\n");
+    HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
+}
+
+//Hàm v ? home
+void move_to_home() {
+    // Set home speed and reset target_reached flags
+    motor1.speed = HOME_RPM;
+    motor2.speed = HOME_RPM;
+    motor3.speed = HOME_RPM;
+
+    motor1.target_reached = false;
+    motor2.target_reached = false;
+    motor3.target_reached = false;
+
+    motor1.direction=0;
+    motor2.direction=0;
+    motor3.direction=0;
+    // Start timers for motors
+    start_timers();
+
+    // Loop until all sensors are triggered
+    while (HAL_GPIO_ReadPin(HOME_SENSOR1_PORT, HOME_SENSOR1_PIN) == GPIO_PIN_SET ||
+             HAL_GPIO_ReadPin(HOME_SENSOR2_PORT, HOME_SENSOR2_PIN) == GPIO_PIN_SET ||
+             HAL_GPIO_ReadPin(HOME_SENSOR3_PORT, HOME_SENSOR3_PIN) == GPIO_PIN_SET) {
+
+        // Check if motors have reached home by updating each motor's direction as needed
+        if (HAL_GPIO_ReadPin(HOME_SENSOR1_PORT, HOME_SENSOR1_PIN) == GPIO_PIN_RESET) {
+            motor1.target_reached = true;
+        } if (HAL_GPIO_ReadPin(HOME_SENSOR2_PORT, HOME_SENSOR2_PIN) == GPIO_PIN_RESET) {
+            motor2.target_reached = true;
+        } if (HAL_GPIO_ReadPin(HOME_SENSOR3_PORT, HOME_SENSOR3_PIN) == GPIO_PIN_RESET) {
+            motor3.target_reached = true;
+        }
+    }
+   // HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
+    // Stop all timers after reaching home
+    HAL_TIM_Base_Stop_IT(&htim1);
+       HAL_TIM_Base_Stop_IT(&htim3);
+       HAL_TIM_Base_Stop_IT(&htim4);
+
+       motor1.current_steps = 0;
+       motor2.current_steps = 0;
+       motor3.current_steps = 0;
+
+       motor1.current_angle = -33.5;
+       motor2.current_angle = -33;
+motor3.current_angle = -33;
+
+       HOME_CHECK = true;
+       HAL_Delay(200);
+       move_to(0, 0, -284);
+       HAL_Delay(500);
+       printf("Homing completed. All angles reset to 0.\n");
+}
+// Hàm tính bước
+int calculate_steps(float angle) {
+    return 2*abs(round((angle* 200* MICROSTEPPING* GEARBOX) / 360));
+}
+
+// Hàm tăng tốc mượt mà
+float sigmoid_acceleration(float progress) {
+    float k = 2.0f;       //  ?ộ dốc của đư ?ng cong sigmoid
+    float x_center = 0.5f; // Giá trị giữa khoảng (0.0 đến 1.0)
+    return 1.0f / (1.0f + expf(-k * (progress - x_center)));
+}
+
+// Cập nhật tốc độ
+void update_speed(Motor *motor) {
+    float progress = (float)motor->current_steps / motor->total_steps;
+    float sig_value =  sigmoid_acceleration(progress);
+    motor->speed = MIN_RPM + (MAX_RPM - MIN_RPM) * sig_value;
+}
+
+// Hàm điểu khiển bước của động cơ và đổi chi ?u
+void step_motor(Motor *motor, GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_TypeDef *DIR_PORT, uint16_t DIR_PIN) {
+    int angle_difference = motor->target_angle - motor->current_angle;
+
+    if (angle_difference > 0) {
+        HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_RESET);
+        motor->direction = 1;
+    } else if (angle_difference < 0 || HOME_CHECK==false) {
+        HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_SET);
+        motor->direction = 0;
+    }
+
+    // Chạy động cơ và cập nhật số bước
+       if (motor->current_steps < motor->total_steps) {
+           motor->current_steps++;
+           update_speed(motor);
+           HAL_GPIO_TogglePin(GPIOx, GPIO_Pin);
+       } else if (HOME_CHECK == false) {
+           HAL_GPIO_TogglePin(GPIOx, GPIO_Pin);
+       } else {
+           if (HOME_CHECK == true)
+               motor->target_reached = true;
+       }
+
+}
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+
+    // Kiểm tra xem động cơ có đạt đến mục tiêu chưa
+
+    if (htim->Instance == TIM1 && !motor1.target_reached) {
+        if ((int)(motor1.current_steps * ratio1) % (int)ratio1 == 0) {
+            step_motor(&motor1, GPIOE, GPIO_PIN_9, MOTOR1_DIR_PORT, MOTOR1_DIR_PIN);
+        }
+        __HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (motor1.speed  * MICROSTEPPING));
+       htim->Instance->CCR1 = (CLOCK_FREQ / (motor1.speed  * MICROSTEPPING)) / 2;
+    }
+
+    //  ?i ?u khiển động cơ 2
+    if (htim->Instance == TIM3 && !motor2.target_reached) {
+        if ((int)(motor2.current_steps * ratio2) % (int)ratio2 == 0) {
+            step_motor(&motor2, GPIOE, GPIO_PIN_11, MOTOR2_DIR_PORT, MOTOR2_DIR_PIN);
+        }
+        __HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (motor2.speed  * MICROSTEPPING));
+        htim->Instance->CCR1 = (CLOCK_FREQ / (motor2.speed  * MICROSTEPPING)) / 2;
+    }
+
+    //  ?i ?u khiển động cơ 3
+    if (htim->Instance == TIM4 && !motor3.target_reached) {
+        if ((int)(motor3.current_steps * ratio3) % (int)ratio3 == 0) {
+            step_motor(&motor3, GPIOE, GPIO_PIN_13, MOTOR3_DIR_PORT, MOTOR3_DIR_PIN);
+        }
+__HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (motor3.speed * MICROSTEPPING));
+       htim->Instance->CCR1 = (CLOCK_FREQ / (motor3.speed  * MICROSTEPPING)) / 2;
+    }
+
+}
+
+
+// Hàm khởi tạo các thông số động cơ
+void init_motors() {
+    motor1.total_steps = calculate_steps(motor1.target_angle);
+    motor2.total_steps = calculate_steps(motor2.target_angle);
+    motor3.total_steps = calculate_steps(motor3.target_angle);
+
+    max_steps = motor1.total_steps;
+    if (motor2.total_steps > max_steps) max_steps = motor2.total_steps;
+    if (motor3.total_steps > max_steps) max_steps = motor3.total_steps;
+
+    // Tính tỷ lệ bước
+    ratio1 = (float)(max_steps / motor1.total_steps);
+    ratio2 = (float)(max_steps / motor2.total_steps);
+    ratio3 = (float)(max_steps / motor3.total_steps);
+
+    motor1.current_steps = 0;
+    motor2.current_steps = 0;
+    motor3.current_steps = 0;
+
+    motor1.target_reached = false;
+    motor2.target_reached = false;
+    motor3.target_reached = false;
+}
+
+void start_timers() {
+    HAL_TIM_Base_Start_IT(&htim1);
+    HAL_TIM_Base_Start_IT(&htim3);
+    HAL_TIM_Base_Start_IT(&htim4);
+}
+
+bool all_motors_reached_target() {
+    return motor1.target_reached && motor2.target_reached && motor3.target_reached;
+}
+
+void move_to(float x_target, float y_target, float z_target) {
+    const float epsilon = 0.01;
+
+    if (fabs(current_position.x - x_target) < epsilon &&
+        fabs(current_position.y - y_target) < epsilon &&
+        fabs(current_position.z - z_target) < epsilon) {
+        printf("Target position matches current position. No movement needed.\n");
+        return;
+    }
+
+    float theta1, theta2, theta3;
+    int status = delta_calcInverse(x_target, y_target, z_target, &theta1, &theta2, &theta3);
+    if (status != 0) {
+        printf("Invalid target coordinates.\n");
+        return;
+    }
+
+    // Tính góc chênh lệch cho từng động cơ
+    motor1.target_angle = (theta1 - motor1.current_angle);
+    motor2.target_angle = (theta2 - motor2.current_angle);
+    motor3.target_angle = (theta3 - motor3.current_angle);
+
+    init_motors();
+    start_timers();
+    while (!all_motors_reached_target());
+    HAL_TIM_Base_Stop_IT(&htim1);
+    HAL_TIM_Base_Stop_IT(&htim3);
+    HAL_TIM_Base_Stop_IT(&htim4);
+
+    // Cập nhật lại góc hiện tại sau khi di chuyển xong
+    motor1.current_angle += motor1.target_angle;
+    motor2.current_angle += motor2.target_angle;
+    motor3.current_angle += motor3.target_angle;
+    // Cập nhật lại tốc độ
+    motor1.speed=MIN_RPM;
+    motor2.speed=MIN_RPM;
+    motor3.speed=MIN_RPM;
+    // Cập nhật vị trí hiện tại của robot
+    current_position.x = x_target;
+    current_position.y = y_target;
+    current_position.z = z_target;
+
+    //printf("Moved to target position: (%.2f, %.2f, %.2f)\n", x_target, y_target, z_target);
+}
+
+// Hàm động h ?c nghịch cho robot delta
+int delta_calcInverse(float x0, float y0, float z0, float *theta1, float *theta2, float *theta3) {
+*theta1 = *theta2 = *theta3 = 0; // Khởi tạo các góc
+	    int status = delta_calcAngleYZ(x0, y0, z0, theta1);
+	    if (status == 0) status = delta_calcAngleYZ(x0 * cos120 + y0 * sin120, y0 * cos120 - x0 * sin120, z0, theta2);
+	    if (status == 0) status = delta_calcAngleYZ(x0 * cos120 - y0 * sin120, y0 * cos120 + x0 * sin120, z0, theta3);
+	    return status;
+}
+int delta_calcAngleYZ(float x0, float y0, float z0, float *theta) {
+    float y1 = -0.5 * tan30 * f; // f/2 * tan(30 deg)
+    y0 -= 0.5 * tan30 * e; // Dịch tâm sang cạnh
+
+    // z = a + b*y
+    float a = (x0 * x0 + y0 * y0 + z0 * z0 + rf * rf - re * re - y1 * y1) / (2.0 * z0);
+    float b = (y1 - y0) / z0;
+
+    //  ?ịnh thức
+    float d = -(a + b * y1) * (a + b * y1) + rf * (b * b * rf + rf);
+if (d < 0) {
+        return 1;  // Không tồn tại
+    }
+
+    float yj = (y1 - a * b - sqrt(d)) / (b * b + 1); // Ch ?n điểm ngoài
+    float zj = a + b * yj;
+
+    *theta = atan(-zj / (y1 - yj)) * 180.0 / pi + ((yj > y1) ? 180.0 : 0.0);
+    return 0;  // Không có lỗi
+}
+// Hàm động h ?c thuận (theta1, theta2, theta3) -> (x0, y0, z0)
+int delta_calcForward(float theta1, float theta2, float theta3, float *x0, float *y0, float *z0) {
+	float t = (f - e) * tan30 / 2;
+	    float dtr = pi / 180.0;
+
+	    theta1 *= dtr;
+	    theta2 *= dtr;
+	    theta3 *= dtr;
+
+	    float y1 = -(t + rf * cos(theta1));
+	    float z1 = -rf * sin(theta1);
+
+	    float y2 = (t + rf * cos(theta2)) * sin30;
+	    float x2 = y2 * tan60;
+	    float z2 = -rf * sin(theta2);
+
+	    float y3 = (t + rf * cos(theta3)) * sin30;
+	    float x3 = -y3 * tan60;
+	    float z3 = -rf * sin(theta3);
+
+	    float dnm = (y2 - y1) * x3 - (y3 - y1) * x2;
+
+	    float w1 = y1 * y1 + z1 * z1;
+	    float w2 = x2 * x2 + y2 * y2 + z2 * z2;
+	    float w3 = x3 * x3 + y3 * y3 + z3 * z3;
+
+	    float a1 = (z2 - z1) * (y3 - y1) - (z3 - z1) * (y2 - y1);
+	    float b1 = -((w2 - w1) * (y3 - y1) - (w3 - w1) * (y2 - y1)) / 2.0;
+
+	    float a2 = -(z2 - z1) * x3 + (z3 - z1) * x2;
+	    float b2 = ((w2 - w1) * x3 - (w3 - w1) * x2) / 2.0;
+
+	    float a = a1 * a1 + a2 * a2 + dnm * dnm;
+	    float b = 2 * (a1 * b1 + a2 * (b2 - y1 * dnm) - z1 * dnm * dnm);
+	    float c = (b2 - y1 * dnm) * (b2 - y1 * dnm) + b1 * b1 + dnm * dnm * (z1 * z1 - re * re);
+
+	    float d = b * b - 4 * a * c;
+	    if (d < 0) return -1;
+
+	    *z0 = -0.5 * (b + sqrt(d)) / a;
+	    *x0 = (a1 * (*z0) + b1) / dnm;
+	    *y0 = (a2 * (*z0) + b2) / dnm;
+
+	    return 0;
+}
+void ProcessReceivedData() {
+    if (data_received_flag) {
+        data_received_flag = 0;  // Xóa cờ để xử lý dữ liệu mới
+
+        char *newline_pos = strchr((char *)uart_rx_buffer, '\n');
+        if (newline_pos != NULL) {
+            *newline_pos = '\0';  // Kết thúc chuỗi tại vị trí xuống dòng
+
+            // Tách dữ liệu theo định dạng color,x,y
+            char *color_token = strtok((char *)uart_rx_buffer, ",");
+            char *x_token = strtok(NULL, ",");
+            char *y_token = strtok(NULL, ",");
+
+            if (color_token && x_token && y_token) {
+                uint8_t color = (uint8_t)atoi(color_token);  // Chuyển đổi thành uint8_t
+                float x = atof(x_token);                    // Chuyển đổi thành float
+                float y = atof(y_token);                    // Chuyển đổi thành float
+
+                if (!isDuplicate(x, y, color)) {
+                    addPoint(x, y, color);  // Lưu dữ liệu vào mảng
+
+                } else {
+                    printf("Duplicate point detected. Ignored.\n");
+                }
+            } else {
+                printf("Lỗi: Dữ liệu không hợp lệ!\n");
+            }
+        }
+
+        memset((char *)uart_rx_buffer, 0, UART_RX_BUFFER_SIZE);  // Xóa bộ đệm UART
+    }
+}
+
+// Callback khi DMA hoàn thành
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        data_received_flag = 1;  // Cờ báo dữ liệu đã nhận xong
+       // HAL_UART_DMAStop(&huart2);
+        ProcessReceivedData();
+        // Tiếp tục nhận dữ liệu mới để DMA hoạt động lặp không ngừng
+        //HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
+       // HAL_UART_DMAStop(&huart2);
+
+    }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_I2C1_Init();
+  MX_I2S3_Init();
+  MX_SPI1_Init();
+  MX_USB_HOST_Init();
+  MX_USART2_UART_Init();
+  MX_TIM1_Init();
+  MX_TIM3_Init();
+  MX_TIM4_Init();
+  /* USER CODE BEGIN 2 */
+ move_to_home();
+ HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
+   /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+    MX_USB_HOST_Process();
+
+    /* USER CODE BEGIN 3 */
+
+
+    if (point_index > 0) {
+        // Di chuyển tới vị trí của sản phẩm
+
+         move_to_fix(points[0].x, points[0].y, -350);
+           HAL_Delay(50);
+      
+        // Bật bơm
+        turn_on_pump();
+
+        move_to(points[0].x, points[0].y, -300);
+        HAL_Delay(50);
+
+        // Xác định tọa độ cần thả dựa trên màu 
+        float next_x, next_y, next_z;
+        switch (points[0].color) {
+            case 1:
+
+                next_x = -100;
+                next_y = 1;
+                next_z = -320;
+                break;
+            case 2:
+                next_x = -100;
+                next_y = 75;
+                next_z = -320;
+                break;
+            case 3:
+                next_x = -100;
+                next_y = -75;
+                next_z = -320;
+                break;
+            default:
+                printf("Color không hợp lệ!\n");
+                turn_off_pump();
+                return;
+        }
+
+        // Di chuyển tới vị trí cần thả sản phẩm 
+        move_to(next_x, next_y, next_z);
+
+        // Tắt bơm
+        turn_off_pump();
+        HAL_Delay(50);
+       move_to(0,0,-284);
+       HAL_Delay(50);
+
+        // Cập nhật mảng points sau khi đã xử lý xong điểm đầu tiên
+        for (int i = 0; i < point_index - 1; i++) {
+            points[i] = points[i + 1];
+        }
+        point_index--;
+    }
+
+   }
+
+  /* USER CODE END 3 */
+}
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief I2S3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2S3_Init(void)
+{
+
+  /* USER CODE BEGIN I2S3_Init 0 */
+
+  /* USER CODE END I2S3_Init 0 */
+
+  /* USER CODE BEGIN I2S3_Init 1 */
+
+  /* USER CODE END I2S3_Init 1 */
+  hi2s3.Instance = SPI3;
+  hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
+  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
+  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
+  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_96K;
+  hi2s3.Init.CPOL = I2S_CPOL_LOW;
+  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
+  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
+  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2S3_Init 2 */
+
+  /* USER CODE END I2S3_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 0;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 0;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 0;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 0;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOE, CS_I2C_SPI_Pin|PUL_1_Pin|DIR_1_Pin|PUL_2_Pin
+                          |DIR_2_Pin|PUL_3_Pin|DIR_3_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
+                          |Bump_Pin|Audio_RST_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : CS_I2C_SPI_Pin DIR_1_Pin DIR_2_Pin DIR_3_Pin */
+  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin|DIR_1_Pin|DIR_2_Pin|DIR_3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
+  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PDM_OUT_Pin */
+  GPIO_InitStruct.Pin = PDM_OUT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BOOT1_Pin */
+  GPIO_InitStruct.Pin = BOOT1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PUL_1_Pin PUL_2_Pin PUL_3_Pin */
+  GPIO_InitStruct.Pin = PUL_1_Pin|PUL_2_Pin|PUL_3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : CLK_IN_Pin */
+  GPIO_InitStruct.Pin = CLK_IN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PD8 PD9 PD10 OTG_FS_OverCurrent_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|OTG_FS_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
+                           Bump_Pin Audio_RST_Pin */
+  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
+                          |Bump_Pin|Audio_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : MEMS_INT2_Pin */
+  GPIO_InitStruct.Pin = MEMS_INT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
+
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+/* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
