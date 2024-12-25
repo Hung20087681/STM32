@@ -1,3 +1,4 @@
+
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -32,11 +33,19 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+    STATE_IDLE,
+    STATE_HOME,
+    STATE_MOVE_TO
+
+
+
+} RobotState;
+RobotState current_state = STATE_IDLE;
 typedef struct {
     float target_angle;
     int current_steps;
     int total_steps;
-    float speed;
     bool target_reached;
     int direction; // 1 = forward, 0 = reverse
     float current_angle; // Lưu góc hiện tại của động cơ
@@ -47,9 +56,7 @@ typedef struct {
     float y;
     float z;
 } Position;
-#define UART_RX_BUFFER_SIZE 500
-// File main.c hoặc header file (main.h)
-#define MAX_COORDS 10
+
 
 // Khai báo kiểu dữ liệu struct Point chuẩn
 typedef struct {
@@ -57,17 +64,16 @@ typedef struct {
     float y;
     uint8_t color;
 } Point;
-#define MAX_POINTS 100 // Giới hạn số điểm tối đa
 
-Point points[MAX_POINTS];  // Mảng lưu trữ các tọa độ
-int point_index = 0;       // Ban đầu không có bất kỳ điểm nào
+
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define MAX_RPM 300
-#define MIN_RPM 100
-#define HOME_RPM 60
+#define MAX_RPM 500
+#define MIN_RPM 30
+#define HOME_RPM 50
 #define CLOCK_FREQ 84000000
 #define MICROSTEPPING 64
 #define STEP_ANGLE 1.8
@@ -93,7 +99,19 @@ int point_index = 0;       // Ban đầu không có bất kỳ điểm nào
 #define BUM_PIN GPIO_PIN_0
 #define BUM_PORT GPIOD
 
+#define START_BUTTON_DIR_PIN GPIO_PIN_4
+#define HOME_BUTTON_DIR_PIN GPIO_PIN_5
+#define STOP_BUTTON_DIR_PIN GPIO_PIN_6
 
+
+#define START_BUTTON_DIR_PORT GPIOE
+#define HOME_BUTTON_DIR_PORT GPIOE
+#define STOP_BUTTON_DIR_PORT GPIOE
+
+#define DMA_BUFFER_SIZE 256
+#define MAX_BUFFER_SIZE 512 // Kích thước tối đa của buffer
+char processing_buffer[MAX_BUFFER_SIZE]; // Lưu trữ dữ liệu đầy đủ để xử lý
+size_t buffer_index = 0;                 // Vị trí hiện tại trong buffer
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -109,41 +127,47 @@ I2S_HandleTypeDef hi2s3;
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim3;
-TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
-DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
-// Thông số hình hoc của robot delta
-const float e = 40.0;    //  ?ầu cuối
-const float f = 100.0;    //  ?ế
-const float re = 370.0;
-const float rf = 220.0;
+const float e = 138.56;     // end effector
+ const float f = 346.41;     // base
+ const float re = 370.0;
+ const float rf =220.0;
 
-// Hằng số lượng giác
-const float sqrt3 = sqrt(3.0);
-const float pi = 3.141592653;
-const float sin120 = sqrt3 / 2.0;
-const float cos120 = -0.5;
-const float tan60 = sqrt3;
-const float sin30 = 0.5;
-const float tan30 = 1 / sqrt3;
+ // trigonometric constants
+ const float sqrt3 = sqrt(3.0);
+ const float pi = 3.141592653;    // PI
+ const float sin120 = sqrt3/2.0;
+ const float cos120 = -0.5;
+ const float tan60 = sqrt3;
+ const float sin30 = 0.5;
+ const float tan30 = 1/sqrt3;
 
-Motor motor1 = {0, 0, 0, MIN_RPM, false, 0, 0};
-Motor motor2 = {0, 0, 0, MIN_RPM, false, 0, 0};
-Motor motor3 = {0, 0, 0, MIN_RPM, false, 0, 0};
+Motor motor1 = {0, 0, 0, false, 0, 0};
+Motor motor2 = {0, 0, 0, false, 0, 0};
+Motor motor3 = {0, 0, 0, false, 0, 0};
 
+int move_color=0,move_x=0,move_y=0;
 float ratio1 = 1.0, ratio2 = 1.0, ratio3 = 1.0;
-int max_steps = 0;
+ int max_steps = 0,max_current=0;
+ float syn_speed=MIN_RPM;
+
 bool HOME_CHECK = false;
+bool BUMP_CHECK = false;
+bool OBJECT_CHECK = false;
+
 Position current_position ;
-//Coordinate current_coordinate;
-volatile char uart_rx_buffer[UART_RX_BUFFER_SIZE]; // Bộ đệm nhận DMA
-volatile uint8_t data_received_flag = 0;          // C ? báo dữ liệu đã nhận xong
-             // Vị trí lưu dữ liệu tiếp theo
+
+uint8_t dma_rx_buffer[DMA_BUFFER_SIZE]; // Buffer DMA
+volatile int current_color = 0;                  // Màu (dạng số nguyên)
+volatile int current_x = 0, current_y = 0;       // T ?a độ X, Y (có thể âm hoặc dương)
+volatile uint16_t dma_last_pos = 0;
+float next_x,next_y;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -155,113 +179,260 @@ static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM1_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
 void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
-int delta_calcAngleYZ(float x0, float y0, float z0, float *theta);
+
 int calculate_steps(float angle);
 float sigmoid_acceleration(float progress);
-void update_speed(Motor *motor);
+void update_speed();
 void step_motor(Motor *motor, GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_TypeDef *DIR_PORT, uint16_t DIR_PIN);
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim);
 void init_motors();
 void start_timers();
 bool all_motors_reached_target();
+int delta_calcAngleYZ(float x0, float y0, float z0, float *theta);
 int delta_calcInverse(float x0, float y0, float z0, float *theta1, float *theta2, float *theta3);
 int delta_calcForward(float theta1, float theta2, float theta3, float *x0, float *y0, float *z0);
 void move_to(float x_target, float y_target, float z_target);
 void move_to_home();
-void ProcessReceivedData();
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void turn_on_pump() ;
 void turn_off_pump();
-bool isDuplicate(float x, float y, uint8_t color);
-void addPoint(float x, float y, uint8_t color);
-void handle_uart_data(uint8_t color, float x, float y);
-void move_to_fix(float x_target, float y_target, float z_target);
+void process_uart_data(uint8_t *data, uint16_t length);
+void update_coordinates(int color, int x, int y);
+void move_with_parabolic_curve(float x0, float y0, float z0,
+                               float x1, float y1, float z1,
+                               float h, uint32_t duration_ms);
+
+void update_position();
+void handle_idle_state();
+void handle_move_to_state();
+void handle_home_state();
+void process_dma_uart();
+void stop_all_timers();
+uint8_t delay_non_blocking(uint32_t delay_time_ms);
+void update_max_current();
+void check_object_from_webcam();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void move_to_fix(float x_target, float y_target, float z_target){
-	if(x_target>0 && y_target>0 && y_target<x_target){
-		z_target=0.1425*sqrt(x_target*x_target + y_target*y_target)-351.27 ;
-			}
-	if(x_target>0 && y_target>0 && y_target>x_target){
-			z_target=0.2318*sqrt(x_target*x_target + y_target*y_target)-360.89 ;
-				}
-	if(x_target>0 && y_target<0 && abs(y_target)>x_target){
-				z_target=0.2295*sqrt(x_target*x_target + y_target*y_target)-361 ;
-					}
-	if(x_target<0 && y_target>0 && y_target>abs(x_target)){
-		z_target=0.1527*sqrt(x_target*x_target + y_target*y_target)-353.08;
-					}
-	if(x_target<0 && y_target>0 && y_target<abs(x_target)){
-			z_target=0.1054*sqrt(x_target*x_target + y_target*y_target)-349.50;
-						}
-	if(x_target>0 && y_target<0 && abs(y_target)<x_target){
-		z_target=0.1741*sqrt(x_target*x_target + y_target*y_target)-355.94;
-		}
 
-	move_to(x_target, y_target, z_target);
+void check_object_from_webcam(){
+	if (abs(current_x- move_x) < 2 &&
+	        abs(current_y - move_y) < 2 &&
+			current_color == move_color){
+	       OBJECT_CHECK=false;
+	    }else {	   OBJECT_CHECK=true; }
 }
-void handle_uart_data(uint8_t color, float x, float y) {
-    if (point_index < 100) {
-        points[point_index].color = color;  // Gán giá trị màu
-        points[point_index].x = x;         // Gán tọa độ x
-        points[point_index].y = y;         // Gán tọa độ y
-        point_index++;                     // Tăng chỉ số điểm tiếp theo
+void update_max_current(){
+	if(max_steps==motor1.total_steps){
+		max_current=motor1.current_steps;
+	}
+	if(max_steps==motor2.total_steps){
+			max_current=motor2.current_steps;
+	}
+	if(max_steps==motor3.total_steps){
+			max_current=motor3.current_steps;
+	}
+}
+// Hàm delay không chặn
+uint8_t delay_non_blocking(uint32_t delay_time_ms) {
+    static uint32_t start_time = 0;
+    static uint8_t is_running = 0;
+
+    // Bắt đầu trễ
+    if (!is_running) {
+        start_time = HAL_GetTick(); // Lấy th ?i gian hiện tại
+        is_running = 1;             //  ?ánh dấu đang chạy
+        return 0;                   // Chưa hết th ?i gian trễ
+    }
+
+    // Kiểm tra th ?i gian trễ
+    if ((HAL_GetTick() - start_time) >= delay_time_ms) {
+        is_running = 0;             // Kết thúc trễ
+        return 1;                   // Th ?i gian trễ hoàn thành
+    }
+
+    return 0;                       // Chưa hết th ?i gian trễ
+}
+
+void stop_all_timers() {
+    HAL_TIM_Base_Stop_IT(&htim1);
+}
+
+void process_dma_uart() {
+    uint16_t pos = DMA_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(huart2.hdmarx);
+    if (pos != dma_last_pos) {
+        uint16_t length = (pos > dma_last_pos) ? (pos - dma_last_pos) : (DMA_BUFFER_SIZE - dma_last_pos);
+        process_uart_data(&dma_rx_buffer[dma_last_pos], length);
+        dma_last_pos = pos;
     }
 }
 
-// Hàm kiểm tra xem giá trị mới đã tồn tại chưa
-bool isDuplicate(float x, float y, uint8_t color) {
-    for (int i = 0; i < point_index; i++) {
-        // So sánh từng phần tử trong mảng `points` với giá trị mới
-        if (fabs(points[i].x - x) < 0.001 &&  // So sánh x với sai số nhỏ
-            fabs(points[i].y - y) < 0.001 &&  // So sánh y với sai số nhỏ
-            points[i].color == color) {       // So sánh color
-            return true; // Điểm đã tồn tại
+void handle_idle_state() {
+    // Ch ? lệnh di chuyển hoặc homing
+
+		if (HAL_GPIO_ReadPin(START_BUTTON_DIR_PORT, START_BUTTON_DIR_PIN) == 0 && HOME_CHECK==true) {
+    	delay_non_blocking(20);
+        current_state = STATE_MOVE_TO;
+    }  else if ( HAL_GPIO_ReadPin(HOME_BUTTON_DIR_PORT, HOME_BUTTON_DIR_PIN) == 0 && HOME_CHECK==false) {
+    	delay_non_blocking(20);
+        current_state = STATE_HOME;
+    }
+
+}
+void handle_move_to_state() {
+	check_object_from_webcam();
+	update_position();
+
+
+	    switch(current_color){
+	    case 1:
+	    								next_x = 90;
+	                                      next_y = -90;
+	                                      break;
+	    case 3:
+	                                      next_x = 0;
+	                                      next_y = -115;
+	                                      break;
+	    case 2:
+	                                      next_x = -80;
+	                                      next_y = -90;
+	                                      break;
+	    }
+	    move_with_parabolic_curve(current_x, current_y+10, -292, next_x, next_y, -240,40,20);
+	    turn_off_pump();
+	    move_to(0, 0, -230);
+	        // Kiểm tra nếu hoàn thành
+	        if (OBJECT_CHECK==false || HAL_GPIO_ReadPin(STOP_BUTTON_DIR_PORT, STOP_BUTTON_DIR_PIN)== 0) {
+	            current_state = STATE_IDLE;
+	        }else if(OBJECT_CHECK==true){
+	        	current_state = STATE_MOVE_TO;
+	        }
+	    }
+
+
+
+
+void handle_home_state() {
+    // Thực hiện homing
+	move_to_home();
+    // Kiểm tra nếu hoàn thành homing
+    if (HOME_CHECK==true) {
+        current_state = STATE_IDLE;
+    }
+}
+void update_position(){
+	move_color=current_color;
+	move_x=current_x;
+	move_y=current_y;
+
+}
+
+void move_with_parabolic_curve(float x0, float y0, float z0,
+                               float x1, float y1, float z1,
+                               float h, uint32_t duration_ms) {
+    const uint16_t steps = 2; // Số bước chia nh ?
+    const float step_time_ms = (float)duration_ms / steps; // Th ?i gian mỗi bước
+
+    float dx = (x1 - x0) / steps; // Bước nhảy trục X
+    float dy = (y1 - y0) / steps; // Bước nhảy trục Y
+    float t = 0.0; // Hệ số nội suy
+
+    float x_current = x0;
+    float y_current= y0;
+    float z_current = z0;
+
+    for (uint16_t i = 0; i <= steps; i++) {
+        t = (float)i / steps; // Hệ số nội suy từ 0 đến 1
+
+        // Tính t ?a độ Z theo đư ?ng cong parabol
+        z_current = z0 + (z1 - z0) * t + (4 * h * t * (1 - t));
+
+        // Cập nhật t ?a độ X và Y tuyến tính
+        x_current = x0 + dx * i;
+        y_current = y0 + dy * i;
+
+        // Gửi lệnh di chuyển
+        move_to(x_current, y_current, z_current);
+        turn_on_pump();
+
+
+    }
+
+    //  ?ảm bảo robot đến chính xác điểm cuối
+    move_to(x1, y1, z1);
+}
+
+void update_coordinates(int color, int x, int y) {
+    // Sao chép giá trị vào biến toàn cục
+    current_color = color;
+    current_x = x;
+    current_y = y;
+    // Debug hoặc kiểm tra kết quả
+}
+
+void process_uart_data(uint8_t *data, uint16_t length) {
+    // Kiểm tra tràn bộ nhớ
+    if (buffer_index + length >= MAX_BUFFER_SIZE) {
+        // Xử lý lỗi: xóa buffer để tránh tràn
+        buffer_index = 0;
+    }
+
+    // Sao chép dữ liệu mới nhận vào buffer tạm th ?i
+    memcpy(&processing_buffer[buffer_index], data, length);
+    buffer_index += length;
+
+    //  ?ảm bảo chuỗi trong buffer luôn kết thúc bằng NULL
+    processing_buffer[buffer_index] = '\0';
+
+    // Tách các dòng hoàn chỉnh bằng '\n'
+    char *line_start = processing_buffer;
+    char *line_end = strchr(line_start, '\n');
+
+    while (line_end != NULL) {
+        *line_end = '\0'; // Thay '\n' bằng NULL để tạo thành chuỗi hoàn chỉnh
+
+        // Phân tích chuỗi "color,x,y"
+        int color, x, y;
+        if (sscanf(line_start, "%d,%d,%d", &color, &x, &y) == 3) {
+            update_coordinates(color, x, y); // G ?i hàm xử lý t ?a độ
         }
+
+        // Di chuyển đến dòng tiếp theo
+        line_start = line_end + 1;
+        line_end = strchr(line_start, '\n');
     }
-    return false; // Điểm chưa tồn tại
+
+    // Lưu phần còn lại (chuỗi chưa hoàn chỉnh) vào đầu buffer
+    size_t remaining_length = strlen(line_start);
+    memmove(processing_buffer, line_start, remaining_length);
+    buffer_index = remaining_length;
+
+    //  ?ảm bảo buffer kết thúc bằng NULL
+    processing_buffer[buffer_index] = '\0';
 }
-
-void addPoint(float x, float y, uint8_t color) {
-    if (point_index < MAX_POINTS) {
-        points[point_index].x = x;
-        points[point_index].y = y;
-        points[point_index].color = color;
-        point_index++; // Tăng số lượng điểm sau khi thêm thành công
-    } else {
-        printf("Mảng điểm đầy, không thể lưu thêm!\n");
-    }
-}
-
-
-
 // Bật bơm
 void turn_on_pump() {
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0, GPIO_PIN_SET);  // Bật chân PD0
-    printf("Pump turned ON.\n");
-    HAL_UART_DMAStop(&huart2);
+    BUMP_CHECK=true;
+
+
 }
 
 // Tắt bơm
 void turn_off_pump() {
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0, GPIO_PIN_RESET);  // Tắt chân PD0
-    printf("Pump turned OFF.\n");
-    HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
-}
+    BUMP_CHECK=false;
 
-//Hàm v ? home
+}
+//Hàm ve home
 void move_to_home() {
     // Set home speed and reset target_reached flags
-    motor1.speed = HOME_RPM;
-    motor2.speed = HOME_RPM;
-    motor3.speed = HOME_RPM;
+    HOME_CHECK = false;
+    syn_speed= HOME_RPM;
+
 
     motor1.target_reached = false;
     motor2.target_reached = false;
@@ -287,25 +458,21 @@ void move_to_home() {
             motor3.target_reached = true;
         }
     }
-   // HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
+
     // Stop all timers after reaching home
-    HAL_TIM_Base_Stop_IT(&htim1);
-       HAL_TIM_Base_Stop_IT(&htim3);
-       HAL_TIM_Base_Stop_IT(&htim4);
+    stop_all_timers();
 
        motor1.current_steps = 0;
        motor2.current_steps = 0;
        motor3.current_steps = 0;
 
-       motor1.current_angle = -33.5;
-       motor2.current_angle = -33;
-motor3.current_angle = -33;
+       motor1.current_angle = -36.167205414;
+       motor2.current_angle =-36.167205414;
+       motor3.current_angle =-36.167205414;
 
        HOME_CHECK = true;
-       HAL_Delay(200);
-       move_to(0, 0, -284);
-       HAL_Delay(500);
-       printf("Homing completed. All angles reset to 0.\n");
+       move_to(0, 0, -241);
+       delay_non_blocking(50);
 }
 // Hàm tính bước
 int calculate_steps(float angle) {
@@ -314,34 +481,35 @@ int calculate_steps(float angle) {
 
 // Hàm tăng tốc mượt mà
 float sigmoid_acceleration(float progress) {
-    float k = 2.0f;       //  ?ộ dốc của đư ?ng cong sigmoid
+    float k =0.001f;       //  ?ộ dốc của đư ?ng cong sigmoid
     float x_center = 0.5f; // Giá trị giữa khoảng (0.0 đến 1.0)
     return 1.0f / (1.0f + expf(-k * (progress - x_center)));
 }
 
 // Cập nhật tốc độ
-void update_speed(Motor *motor) {
-    float progress = (float)motor->current_steps / motor->total_steps;
-    float sig_value =  sigmoid_acceleration(progress);
-    motor->speed = MIN_RPM + (MAX_RPM - MIN_RPM) * sig_value;
+void update_speed() {
+    float progress = (float)max_current / max_steps; // Tính tiến độ
+    progress = (progress > 1.0f) ? 1.0f : progress;  // Giới hạn từ 0 đến 1
+
+    float sig_value = sigmoid_acceleration(progress);
+    syn_speed = MIN_RPM + (MAX_RPM - MIN_RPM) * sig_value;
+
+
 }
 
-// Hàm điểu khiển bước của động cơ và đổi chi ?u
+// Hàm đi ?u khiển bước của động cơ và đổi chi ?u
 void step_motor(Motor *motor, GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_TypeDef *DIR_PORT, uint16_t DIR_PIN) {
-    int angle_difference = motor->target_angle - motor->current_angle;
-
-    if (angle_difference > 0) {
-        HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_RESET);
-        motor->direction = 1;
-    } else if (angle_difference < 0 || HOME_CHECK==false) {
-        HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_SET);
-        motor->direction = 0;
-    }
-
+    int angle_difference = motor->target_angle;
+    if(HOME_CHECK==true){
+    HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, (angle_difference >= 0) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    motor->direction = (angle_difference >= 0) ? 1 : 0;
+    }else{
+    	HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_SET);
+    	motor->direction = 0;}
     // Chạy động cơ và cập nhật số bước
        if (motor->current_steps < motor->total_steps) {
            motor->current_steps++;
-           update_speed(motor);
+           update_speed();
            HAL_GPIO_TogglePin(GPIOx, GPIO_Pin);
        } else if (HOME_CHECK == false) {
            HAL_GPIO_TogglePin(GPIOx, GPIO_Pin);
@@ -350,38 +518,33 @@ void step_motor(Motor *motor, GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_TypeD
                motor->target_reached = true;
        }
 
+
 }
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     // Kiểm tra xem động cơ có đạt đến mục tiêu chưa
+    process_dma_uart();
+	update_max_current();
 
-    if (htim->Instance == TIM1 && !motor1.target_reached) {
-        if ((int)(motor1.current_steps * ratio1) % (int)ratio1 == 0) {
+    if (htim->Instance == TIM1 && !all_motors_reached_target()) {
+
+        if ((int)max_current % (int)ratio1 == 0 && !motor1.target_reached) {
             step_motor(&motor1, GPIOE, GPIO_PIN_9, MOTOR1_DIR_PORT, MOTOR1_DIR_PIN);
         }
-        __HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (motor1.speed  * MICROSTEPPING));
-       htim->Instance->CCR1 = (CLOCK_FREQ / (motor1.speed  * MICROSTEPPING)) / 2;
-    }
+         if ((int)max_current % (int)ratio2 == 0 && !motor2.target_reached) {
+                   step_motor(&motor2, GPIOE, GPIO_PIN_11, MOTOR2_DIR_PORT, MOTOR2_DIR_PIN);
+               }
 
-    //  ?i ?u khiển động cơ 2
-    if (htim->Instance == TIM3 && !motor2.target_reached) {
-        if ((int)(motor2.current_steps * ratio2) % (int)ratio2 == 0) {
-            step_motor(&motor2, GPIOE, GPIO_PIN_11, MOTOR2_DIR_PORT, MOTOR2_DIR_PIN);
-        }
-        __HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (motor2.speed  * MICROSTEPPING));
-        htim->Instance->CCR1 = (CLOCK_FREQ / (motor2.speed  * MICROSTEPPING)) / 2;
-    }
+         if ((int)max_current % (int)ratio3 == 0 && !motor3.target_reached) {
+                           step_motor(&motor3, GPIOE, GPIO_PIN_13, MOTOR3_DIR_PORT, MOTOR3_DIR_PIN);
 
-    //  ?i ?u khiển động cơ 3
-    if (htim->Instance == TIM4 && !motor3.target_reached) {
-        if ((int)(motor3.current_steps * ratio3) % (int)ratio3 == 0) {
-            step_motor(&motor3, GPIOE, GPIO_PIN_13, MOTOR3_DIR_PORT, MOTOR3_DIR_PIN);
-        }
-__HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (motor3.speed * MICROSTEPPING));
-       htim->Instance->CCR1 = (CLOCK_FREQ / (motor3.speed  * MICROSTEPPING)) / 2;
-    }
+                   }
+        	__HAL_TIM_SET_AUTORELOAD(htim, CLOCK_FREQ / (syn_speed  * MICROSTEPPING));
 
+
+    }
 }
+
 
 
 // Hàm khởi tạo các thông số động cơ
@@ -410,8 +573,7 @@ void init_motors() {
 
 void start_timers() {
     HAL_TIM_Base_Start_IT(&htim1);
-    HAL_TIM_Base_Start_IT(&htim3);
-    HAL_TIM_Base_Start_IT(&htim4);
+
 }
 
 bool all_motors_reached_target() {
@@ -419,19 +581,18 @@ bool all_motors_reached_target() {
 }
 
 void move_to(float x_target, float y_target, float z_target) {
+
     const float epsilon = 0.01;
 
     if (fabs(current_position.x - x_target) < epsilon &&
         fabs(current_position.y - y_target) < epsilon &&
         fabs(current_position.z - z_target) < epsilon) {
-        printf("Target position matches current position. No movement needed.\n");
         return;
     }
 
     float theta1, theta2, theta3;
     int status = delta_calcInverse(x_target, y_target, z_target, &theta1, &theta2, &theta3);
     if (status != 0) {
-        printf("Invalid target coordinates.\n");
         return;
     }
 
@@ -443,144 +604,99 @@ void move_to(float x_target, float y_target, float z_target) {
     init_motors();
     start_timers();
     while (!all_motors_reached_target());
-    HAL_TIM_Base_Stop_IT(&htim1);
-    HAL_TIM_Base_Stop_IT(&htim3);
-    HAL_TIM_Base_Stop_IT(&htim4);
+   stop_all_timers();
 
     // Cập nhật lại góc hiện tại sau khi di chuyển xong
     motor1.current_angle += motor1.target_angle;
     motor2.current_angle += motor2.target_angle;
     motor3.current_angle += motor3.target_angle;
     // Cập nhật lại tốc độ
-    motor1.speed=MIN_RPM;
-    motor2.speed=MIN_RPM;
-    motor3.speed=MIN_RPM;
+    syn_speed=MIN_RPM;
+
     // Cập nhật vị trí hiện tại của robot
     current_position.x = x_target;
     current_position.y = y_target;
     current_position.z = z_target;
-
     //printf("Moved to target position: (%.2f, %.2f, %.2f)\n", x_target, y_target, z_target);
 }
 
 // Hàm động h ?c nghịch cho robot delta
-int delta_calcInverse(float x0, float y0, float z0, float *theta1, float *theta2, float *theta3) {
-*theta1 = *theta2 = *theta3 = 0; // Khởi tạo các góc
-	    int status = delta_calcAngleYZ(x0, y0, z0, theta1);
-	    if (status == 0) status = delta_calcAngleYZ(x0 * cos120 + y0 * sin120, y0 * cos120 - x0 * sin120, z0, theta2);
-	    if (status == 0) status = delta_calcAngleYZ(x0 * cos120 - y0 * sin120, y0 * cos120 + x0 * sin120, z0, theta3);
-	    return status;
-}
-int delta_calcAngleYZ(float x0, float y0, float z0, float *theta) {
-    float y1 = -0.5 * tan30 * f; // f/2 * tan(30 deg)
-    y0 -= 0.5 * tan30 * e; // Dịch tâm sang cạnh
-
-    // z = a + b*y
-    float a = (x0 * x0 + y0 * y0 + z0 * z0 + rf * rf - re * re - y1 * y1) / (2.0 * z0);
-    float b = (y1 - y0) / z0;
-
-    //  ?ịnh thức
-    float d = -(a + b * y1) * (a + b * y1) + rf * (b * b * rf + rf);
-if (d < 0) {
-        return 1;  // Không tồn tại
-    }
-
-    float yj = (y1 - a * b - sqrt(d)) / (b * b + 1); // Ch ?n điểm ngoài
-    float zj = a + b * yj;
-
-    *theta = atan(-zj / (y1 - yj)) * 180.0 / pi + ((yj > y1) ? 180.0 : 0.0);
-    return 0;  // Không có lỗi
-}
-// Hàm động h ?c thuận (theta1, theta2, theta3) -> (x0, y0, z0)
 int delta_calcForward(float theta1, float theta2, float theta3, float *x0, float *y0, float *z0) {
-	float t = (f - e) * tan30 / 2;
-	    float dtr = pi / 180.0;
+     float t = (f-e)*tan30/2;
+     float dtr = pi/(float)180.0;
 
-	    theta1 *= dtr;
-	    theta2 *= dtr;
-	    theta3 *= dtr;
+     theta1 *= dtr;
+     theta2 *= dtr;
+     theta3 *= dtr;
 
-	    float y1 = -(t + rf * cos(theta1));
-	    float z1 = -rf * sin(theta1);
+     float y1 = -(t + rf*cos(theta1));
+     float z1 = -rf*sin(theta1);
 
-	    float y2 = (t + rf * cos(theta2)) * sin30;
-	    float x2 = y2 * tan60;
-	    float z2 = -rf * sin(theta2);
+     float y2 = (t + rf*cos(theta2))*sin30;
+     float x2 = y2*tan60;
+     float z2 = -rf*sin(theta2);
 
-	    float y3 = (t + rf * cos(theta3)) * sin30;
-	    float x3 = -y3 * tan60;
-	    float z3 = -rf * sin(theta3);
+     float y3 = (t + rf*cos(theta3))*sin30;
+     float x3 = -y3*tan60;
+     float z3 = -rf*sin(theta3);
 
-	    float dnm = (y2 - y1) * x3 - (y3 - y1) * x2;
+     float dnm = (y2-y1)*x3-(y3-y1)*x2;
 
-	    float w1 = y1 * y1 + z1 * z1;
-	    float w2 = x2 * x2 + y2 * y2 + z2 * z2;
-	    float w3 = x3 * x3 + y3 * y3 + z3 * z3;
+     float w1 = y1*y1 + z1*z1;
+     float w2 = x2*x2 + y2*y2 + z2*z2;
+     float w3 = x3*x3 + y3*y3 + z3*z3;
 
-	    float a1 = (z2 - z1) * (y3 - y1) - (z3 - z1) * (y2 - y1);
-	    float b1 = -((w2 - w1) * (y3 - y1) - (w3 - w1) * (y2 - y1)) / 2.0;
+     // x = (a1*z + b1)/dnm
+     float a1 = (z2-z1)*(y3-y1)-(z3-z1)*(y2-y1);
+     float b1 = -((w2-w1)*(y3-y1)-(w3-w1)*(y2-y1))/2.0;
 
-	    float a2 = -(z2 - z1) * x3 + (z3 - z1) * x2;
-	    float b2 = ((w2 - w1) * x3 - (w3 - w1) * x2) / 2.0;
+     // y = (a2*z + b2)/dnm;
+     float a2 = -(z2-z1)*x3+(z3-z1)*x2;
+     float b2 = ((w2-w1)*x3 - (w3-w1)*x2)/2.0;
 
-	    float a = a1 * a1 + a2 * a2 + dnm * dnm;
-	    float b = 2 * (a1 * b1 + a2 * (b2 - y1 * dnm) - z1 * dnm * dnm);
-	    float c = (b2 - y1 * dnm) * (b2 - y1 * dnm) + b1 * b1 + dnm * dnm * (z1 * z1 - re * re);
+     // a*z^2 + b*z + c = 0
+     float a = a1*a1 + a2*a2 + dnm*dnm;
+     float b = 2*(a1*b1 + a2*(b2-y1*dnm) - z1*dnm*dnm);
+     float c = (b2-y1*dnm)*(b2-y1*dnm) + b1*b1 + dnm*dnm*(z1*z1 - re*re);
 
-	    float d = b * b - 4 * a * c;
-	    if (d < 0) return -1;
+     // discriminant
+     float d = b*b - (float)4.0*a*c;
+     if (d < 0) return -1; // non-existing point
 
-	    *z0 = -0.5 * (b + sqrt(d)) / a;
-	    *x0 = (a1 * (*z0) + b1) / dnm;
-	    *y0 = (a2 * (*z0) + b2) / dnm;
+     *z0 = -(float)0.5*(b+sqrt(d))/a;
+     *x0 = (a1*(*z0 )+ b1)/dnm;
+     *y0 = (a2*(*z0) + b2)/dnm;
+     return 0;
+ }
 
-	    return 0;
-}
-void ProcessReceivedData() {
-    if (data_received_flag) {
-        data_received_flag = 0;  // Xóa cờ để xử lý dữ liệu mới
+ // inverse kinematics
+ // helper functions, calculates angle theta1 (for YZ-pane)
+ int delta_calcAngleYZ(float x0, float y0, float z0, float *theta) {
+     float y1 = -0.5 * 0.57735 * f; // f/2 * tg 30
+     y0 -= 0.5 * 0.57735    * e;    // shift center to edge
+     // z = a + b*y
+     float a = (x0*x0 + y0*y0 + z0*z0 +rf*rf - re*re - y1*y1)/(2*z0);
+     float b = (y1-y0)/z0;
+     // discriminant
+     float d = -(a+b*y1)*(a+b*y1)+rf*(b*b*rf+rf);
+     if (d < 0) return -1; // non-existing point
+     float yj = (y1 - a*b - sqrt(d))/(b*b + 1); // choosing outer point
+     float zj = a + b*yj;
+    * theta = 180.0*atan(-zj/(y1 - yj))/pi + ((yj>y1)?180.0:0.0);
+     return 0;
+ }
 
-        char *newline_pos = strchr((char *)uart_rx_buffer, '\n');
-        if (newline_pos != NULL) {
-            *newline_pos = '\0';  // Kết thúc chuỗi tại vị trí xuống dòng
+ // inverse kinematics: (x0, y0, z0) -> (theta1, theta2, theta3)
+ // returned status: 0=OK, -1=non-existing position
+ int delta_calcInverse(float x0, float y0, float z0, float *theta1, float *theta2, float *theta3) {
+     *theta1 = *theta2 = *theta3 = 0;
+     int status = delta_calcAngleYZ(x0, y0, z0, theta1);
+     if (status == 0) status = delta_calcAngleYZ(x0*cos120 + y0*sin120, y0*cos120-x0*sin120, z0, theta2);  // rotate coords to +120 deg
+     if (status == 0) status = delta_calcAngleYZ(x0*cos120 - y0*sin120, y0*cos120+x0*sin120, z0, theta3);  // rotate coords to -120 deg
+     return status;
+ }
 
-            // Tách dữ liệu theo định dạng color,x,y
-            char *color_token = strtok((char *)uart_rx_buffer, ",");
-            char *x_token = strtok(NULL, ",");
-            char *y_token = strtok(NULL, ",");
 
-            if (color_token && x_token && y_token) {
-                uint8_t color = (uint8_t)atoi(color_token);  // Chuyển đổi thành uint8_t
-                float x = atof(x_token);                    // Chuyển đổi thành float
-                float y = atof(y_token);                    // Chuyển đổi thành float
-
-                if (!isDuplicate(x, y, color)) {
-                    addPoint(x, y, color);  // Lưu dữ liệu vào mảng
-
-                } else {
-                    printf("Duplicate point detected. Ignored.\n");
-                }
-            } else {
-                printf("Lỗi: Dữ liệu không hợp lệ!\n");
-            }
-        }
-
-        memset((char *)uart_rx_buffer, 0, UART_RX_BUFFER_SIZE);  // Xóa bộ đệm UART
-    }
-}
-
-// Callback khi DMA hoàn thành
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART2) {
-        data_received_flag = 1;  // Cờ báo dữ liệu đã nhận xong
-       // HAL_UART_DMAStop(&huart2);
-        ProcessReceivedData();
-        // Tiếp tục nhận dữ liệu mới để DMA hoạt động lặp không ngừng
-        //HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
-       // HAL_UART_DMAStop(&huart2);
-
-    }
-}
 
 /* USER CODE END 0 */
 
@@ -620,12 +736,11 @@ int main(void)
   MX_USB_HOST_Init();
   MX_USART2_UART_Init();
   MX_TIM1_Init();
-  MX_TIM3_Init();
-  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
- move_to_home();
- HAL_UART_Receive_DMA(&huart2, (uint8_t *)uart_rx_buffer, UART_RX_BUFFER_SIZE);
-   /* USER CODE END 2 */
+//move_to_home();
+HAL_UART_Receive_DMA(&huart2, dma_rx_buffer, DMA_BUFFER_SIZE);
+//move_to(50, 100, -292);
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -635,65 +750,28 @@ int main(void)
     MX_USB_HOST_Process();
 
     /* USER CODE BEGIN 3 */
+    process_dma_uart();
+
+   switch (current_state) {
+          case STATE_IDLE:
+              handle_idle_state();
+              break;
+          case STATE_HOME:
+              handle_home_state();
+              break;
+          case STATE_MOVE_TO:
+              handle_move_to_state();
+              break;
 
 
-    if (point_index > 0) {
-        // Di chuyển tới vị trí của sản phẩm
+      }
 
-         move_to_fix(points[0].x, points[0].y, -350);
-           HAL_Delay(50);
-      
-        // Bật bơm
-        turn_on_pump();
+  }
 
-        move_to(points[0].x, points[0].y, -300);
-        HAL_Delay(50);
-
-        // Xác định tọa độ cần thả dựa trên màu 
-        float next_x, next_y, next_z;
-        switch (points[0].color) {
-            case 1:
-
-                next_x = -100;
-                next_y = 1;
-                next_z = -320;
-                break;
-            case 2:
-                next_x = -100;
-                next_y = 75;
-                next_z = -320;
-                break;
-            case 3:
-                next_x = -100;
-                next_y = -75;
-                next_z = -320;
-                break;
-            default:
-                printf("Color không hợp lệ!\n");
-                turn_off_pump();
-                return;
-        }
-
-        // Di chuyển tới vị trí cần thả sản phẩm 
-        move_to(next_x, next_y, next_z);
-
-        // Tắt bơm
-        turn_off_pump();
-        HAL_Delay(50);
-       move_to(0,0,-284);
-       HAL_Delay(50);
-
-        // Cập nhật mảng points sau khi đã xử lý xong điểm đầu tiên
-        for (int i = 0; i < point_index - 1; i++) {
-            points[i] = points[i + 1];
-        }
-        point_index--;
-    }
-
-   }
 
   /* USER CODE END 3 */
 }
+
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -891,95 +969,6 @@ static void MX_TIM1_Init(void)
 }
 
 /**
-  * @brief TIM3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM3_Init(void)
-{
-
-  /* USER CODE BEGIN TIM3_Init 0 */
-
-  /* USER CODE END TIM3_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM3_Init 1 */
-
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 0;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
-  /* USER CODE END TIM3_Init 2 */
-
-}
-
-/**
-  * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM4_Init(void)
-{
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 0;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
-
-}
-
-/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -995,7 +984,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 600000;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -1023,7 +1012,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream5_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 1);
   HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
 
 }
@@ -1063,6 +1052,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : START_BUTTON_Pin HOME_BUTTON_Pin STOP_BUTTON_Pin */
+  GPIO_InitStruct.Pin = START_BUTTON_Pin|HOME_BUTTON_Pin|STOP_BUTTON_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
@@ -1167,3 +1162,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+Đang hiển thị 5321365177605409005.
